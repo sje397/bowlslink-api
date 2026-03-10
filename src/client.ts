@@ -387,7 +387,11 @@ export class BowlsLinkClient {
             : null,
         };
       })
-      .sort((a, b) => a.round - b.round);
+      .sort((a, b) => {
+        // Regular season before finals, then by round number within each group
+        if (a.isFinals !== b.isFinals) return a.isFinals ? 1 : -1;
+        return a.round - b.round;
+      });
   }
 
   private parseLadderRow(fields: LadderEntry): LadderEntry {
