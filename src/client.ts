@@ -40,6 +40,10 @@ export class BowlsLinkClient {
   /**
    * Fetch all active pennant entries for the club, including competition
    * details, ladder standings, regular-season matches, and finals.
+   *
+   * For divisions where BowlsLink splits regular season and finals into
+   * separate competitions, the regular-season matches are automatically
+   * merged into the finals entry so each team shows the full season.
    */
   async getPennantData(): Promise<PennantData> {
     // 1. Fetch all active entries for the club
@@ -47,7 +51,35 @@ export class BowlsLinkClient {
       `/club/${this.clubId}/entries?filter%5Bstate%5D=active`,
     );
 
-    const entries = entriesPayload.include
+    const entries = this.parseEntries(entriesPayload);
+
+    // 2. Fetch competition detail, ladder, and matches per unique competition
+    const uniqueCompIds = [...new Set(entries.map((e) => e.competitionId).filter(Boolean))] as string[];
+    const competitionData = await this.fetchCompetitionData(uniqueCompIds);
+
+    // 3. For finals-only competitions, find and merge completed regular-season data.
+    //    BowlsLink splits some divisions into separate regular-season and finals
+    //    competitions. The regular-season entry only appears under state=completed.
+    await this.mergeRegularSeasonData(entries, competitionData);
+
+    // 4. Build each team
+    const teams = entries
+      .filter((e) => e.competitionId && competitionData[e.competitionId])
+      .map((entry) => this.buildTeam(entry, competitionData[entry.competitionId!]));
+
+    // Drop entries with no matches and sort by name
+    const activeTeams = teams
+      .filter((t) => t.matches.length > 0)
+      .sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
+
+    return {
+      lastUpdated: new Date().toISOString(),
+      teams: activeTeams,
+    };
+  }
+
+  private parseEntries(payload: { include: JsonApiInclude[] }) {
+    return payload.include
       .filter((item) => item.type === "entry")
       .map((item) => ({
         id: item.id,
@@ -55,17 +87,16 @@ export class BowlsLinkClient {
         competitorId: (item.includes?.competitor as { id: string } | undefined)?.id,
         competitionId: (item.includes?.competition as { id: string } | undefined)?.id,
       }));
+  }
 
-    // 2. Fetch competition detail, ladder, and matches per unique competition
-    const uniqueCompIds = [...new Set(entries.map((e) => e.competitionId).filter(Boolean))] as string[];
-
+  private async fetchCompetitionData(compIds: string[]) {
     const competitionData: Record<string, {
-      compPayload: typeof entriesPayload;
-      ladderPayload: typeof entriesPayload;
-      matchesPayload: typeof entriesPayload;
+      compPayload: { include: JsonApiInclude[] };
+      ladderPayload: { include: JsonApiInclude[] };
+      matchesPayload: { include: JsonApiInclude[] };
     }> = Object.fromEntries(
       await Promise.all(
-        uniqueCompIds.map(async (compId) => {
+        compIds.map(async (compId) => {
           const [compPayload, ladderPayload, matchesPayload, finalsPayload] = await Promise.all([
             this.fetch(`/competition/${compId}`),
             this.fetch(`/competition/${compId}/ladder`),
@@ -83,21 +114,90 @@ export class BowlsLinkClient {
         }),
       ),
     );
+    return competitionData;
+  }
 
-    // 3. Build each team
-    const teams = entries
-      .filter((e) => e.competitionId && competitionData[e.competitionId])
-      .map((entry) => this.buildTeam(entry, competitionData[entry.competitionId!]));
+  /**
+   * For entries in finals-only competitions (knockout comps), find the
+   * corresponding completed regular-season competition and redirect the entry
+   * to use it instead. The regular-season comp already includes finals matches
+   * via the finals-series-matches endpoint, giving us the full season in one
+   * place without duplication.
+   */
+  private async mergeRegularSeasonData(
+    entries: { id: string; name: string; competitorId?: string; competitionId?: string }[],
+    competitionData: Record<string, {
+      compPayload: { include: JsonApiInclude[] };
+      ladderPayload: { include: JsonApiInclude[] };
+      matchesPayload: { include: JsonApiInclude[] };
+    }>,
+  ): Promise<void> {
+    // Identify active entries whose competition name contains "Finals"
+    const finalsEntries: {
+      entry: typeof entries[number];
+      compName: string;
+    }[] = [];
 
-    // Drop entries with no matches and sort by name
-    const activeTeams = teams
-      .filter((t) => t.matches.length > 0)
-      .sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
+    for (const entry of entries) {
+      if (!entry.competitionId || !competitionData[entry.competitionId]) continue;
+      const comp = competitionData[entry.competitionId].compPayload.include
+        .find((i) => i.type === "competition");
+      const compName = String(comp?.attributes?.name ?? "");
+      if (compName.includes("Finals")) {
+        finalsEntries.push({ entry, compName });
+      }
+    }
 
-    return {
-      lastUpdated: new Date().toISOString(),
-      teams: activeTeams,
+    if (finalsEntries.length === 0) return;
+
+    // Fetch completed entries to find matching regular-season competitions
+    const completedPayload = await this.fetch(
+      `/club/${this.clubId}/entries?filter%5Bstate%5D=completed`,
+    );
+    const completedEntries = this.parseEntries(completedPayload);
+
+    // Find matching regular-season comp IDs to fetch
+    type MatchCandidate = {
+      finalsEntry: typeof entries[number];
+      finalsCompName: string;
+      completedEntry: typeof entries[number];
     };
+    const candidates: MatchCandidate[] = [];
+    const compIdsToFetch = new Set<string>();
+
+    for (const { entry: finalsEntry, compName: finalsCompName } of finalsEntries) {
+      for (const completedEntry of completedEntries) {
+        if (completedEntry.name !== finalsEntry.name) continue;
+        if (!completedEntry.competitionId) continue;
+        if (completedEntry.competitionId === finalsEntry.competitionId) continue;
+
+        compIdsToFetch.add(completedEntry.competitionId);
+        candidates.push({ finalsEntry, finalsCompName, completedEntry });
+      }
+    }
+
+    if (compIdsToFetch.size === 0) return;
+
+    // Fetch regular-season competition data (includes finals-series-matches)
+    const regularSeasonData = await this.fetchCompetitionData([...compIdsToFetch]);
+
+    // For each match, redirect the entry to use the regular-season comp data
+    for (const { finalsEntry, finalsCompName, completedEntry } of candidates) {
+      const rsData = regularSeasonData[completedEntry.competitionId!];
+      if (!rsData) continue;
+
+      const rsComp = rsData.compPayload.include.find((i) => i.type === "competition");
+      const rsCompName = String(rsComp?.attributes?.name ?? "");
+
+      // The finals comp name should start with the regular-season comp name
+      // e.g. "...Division 2 Finals (Divisional)" starts with "...Division 2"
+      if (!finalsCompName.startsWith(rsCompName)) continue;
+
+      // Redirect: point the entry at the regular-season competition and competitor
+      competitionData[completedEntry.competitionId!] = rsData;
+      finalsEntry.competitionId = completedEntry.competitionId;
+      finalsEntry.competitorId = completedEntry.competitorId;
+    }
   }
 
   /**
