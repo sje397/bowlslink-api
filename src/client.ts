@@ -46,23 +46,30 @@ export class BowlsLinkClient {
    * merged into the finals entry so each team shows the full season.
    */
   async getPennantData(): Promise<PennantData> {
-    // 1. Fetch all active entries for the club
-    const entriesPayload = await this.fetch(
-      `/club/${this.clubId}/entries?filter%5Bstate%5D=active`,
-    );
+    // 1. Fetch active and completed entries in parallel
+    const [activePayload, completedPayload] = await Promise.all([
+      this.fetch(`/club/${this.clubId}/entries?filter%5Bstate%5D=active`),
+      this.fetch(`/club/${this.clubId}/entries?filter%5Bstate%5D=completed`),
+    ]);
 
-    const entries = this.parseEntries(entriesPayload);
+    const entries = this.parseEntries(activePayload);
 
     // 2. Fetch competition detail, ladder, and matches per unique competition
     const uniqueCompIds = [...new Set(entries.map((e) => e.competitionId).filter(Boolean))] as string[];
     const competitionData = await this.fetchCompetitionData(uniqueCompIds);
 
-    // 3. For finals-only competitions, find and merge completed regular-season data.
-    //    BowlsLink splits some divisions into separate regular-season and finals
-    //    competitions. The regular-season entry only appears under state=completed.
-    await this.mergeRegularSeasonData(entries, competitionData);
+    // 3. Determine the current season prefix from the date.
+    //    Australian bowls season runs October–March, so in March 2026
+    //    the current season is "2025-26".
+    const seasonPrefix = this.currentSeasonPrefix();
 
-    // 4. Build each team
+    // 4. For finals-only competitions, redirect to the completed regular-season
+    //    competition. Also add completed entries for the current season that have
+    //    no active counterpart (e.g. teams whose comp finished without finals).
+    const completedEntries = this.parseEntries(completedPayload);
+    await this.integrateCompletedEntries(entries, completedEntries, competitionData, seasonPrefix);
+
+    // 5. Build each team
     const teams = entries
       .filter((e) => e.competitionId && competitionData[e.competitionId])
       .map((entry) => this.buildTeam(entry, competitionData[entry.competitionId!]));
@@ -77,6 +84,20 @@ export class BowlsLinkClient {
       teams: activeTeams,
     };
   }
+
+  /**
+   * Derive the current bowls season prefix from the date.
+   * Season runs October–March: Oct 2025 → "2025-26", Mar 2026 → "2025-26".
+   */
+  private currentSeasonPrefix(): string {
+    const now = new Date();
+    const year = now.getFullYear();
+    const month = now.getMonth() + 1; // 1-indexed
+    const startYear = month >= 10 ? year : year - 1;
+    const endYear = startYear + 1;
+    return `${startYear}-${String(endYear).slice(-2)}`;
+  }
+
 
   private parseEntries(payload: { include: JsonApiInclude[] }) {
     return payload.include
@@ -118,21 +139,27 @@ export class BowlsLinkClient {
   }
 
   /**
-   * For entries in finals-only competitions (knockout comps), find the
-   * corresponding completed regular-season competition and redirect the entry
-   * to use it instead. The regular-season comp already includes finals matches
-   * via the finals-series-matches endpoint, giving us the full season in one
-   * place without duplication.
+   * Integrate completed entries into the active entries list. Handles two cases:
+   *
+   * 1. **Finals redirect**: An active entry is in a finals-only knockout comp.
+   *    Find the matching completed regular-season comp and redirect the entry
+   *    to use it (the regular-season comp includes finals via finals-series-matches).
+   *
+   * 2. **Standalone completed**: A completed entry for the current season has no
+   *    corresponding active entry (team didn't make finals, or the whole comp
+   *    finished). Add it directly.
    */
-  private async mergeRegularSeasonData(
+  private async integrateCompletedEntries(
     entries: { id: string; name: string; competitorId?: string; competitionId?: string }[],
+    completedEntries: { id: string; name: string; competitorId?: string; competitionId?: string }[],
     competitionData: Record<string, {
       compPayload: { include: JsonApiInclude[] };
       ladderPayload: { include: JsonApiInclude[] };
       matchesPayload: { include: JsonApiInclude[] };
     }>,
+    seasonPrefix: string,
   ): Promise<void> {
-    // Identify active entries whose competition name contains "Finals"
+    // Identify active entries in finals-only competitions
     const finalsEntries: {
       entry: typeof entries[number];
       compName: string;
@@ -148,42 +175,46 @@ export class BowlsLinkClient {
       }
     }
 
-    if (finalsEntries.length === 0) return;
-
-    // Fetch completed entries to find matching regular-season competitions
-    const completedPayload = await this.fetch(
-      `/club/${this.clubId}/entries?filter%5Bstate%5D=completed`,
+    // Track which (name, competitionId) combos are already covered by active entries
+    const coveredCompIds = new Set(
+      entries.map((e) => e.competitionId).filter(Boolean),
     );
-    const completedEntries = this.parseEntries(completedPayload);
 
-    // Find matching regular-season comp IDs to fetch
-    type MatchCandidate = {
+    // Gather completed comp IDs we need to fetch:
+    // - candidates for finals redirect
+    // - candidates for standalone completed entries
+    const compIdsToFetch = new Set<string>();
+
+    type FinalsCandidate = {
       finalsEntry: typeof entries[number];
       finalsCompName: string;
       completedEntry: typeof entries[number];
     };
-    const candidates: MatchCandidate[] = [];
-    const compIdsToFetch = new Set<string>();
+    const finalsCandidates: FinalsCandidate[] = [];
 
-    for (const { entry: finalsEntry, compName: finalsCompName } of finalsEntries) {
-      for (const completedEntry of completedEntries) {
-        if (completedEntry.name !== finalsEntry.name) continue;
-        if (!completedEntry.competitionId) continue;
-        if (completedEntry.competitionId === finalsEntry.competitionId) continue;
+    for (const completedEntry of completedEntries) {
+      if (!completedEntry.competitionId) continue;
+      if (coveredCompIds.has(completedEntry.competitionId)) continue;
 
-        compIdsToFetch.add(completedEntry.competitionId);
-        candidates.push({ finalsEntry, finalsCompName, completedEntry });
+      compIdsToFetch.add(completedEntry.competitionId);
+
+      // Check if this is a finals-redirect candidate
+      for (const { entry: finalsEntry, compName: finalsCompName } of finalsEntries) {
+        if (completedEntry.name === finalsEntry.name) {
+          finalsCandidates.push({ finalsEntry, finalsCompName, completedEntry });
+        }
       }
     }
 
     if (compIdsToFetch.size === 0) return;
 
-    // Fetch regular-season competition data (includes finals-series-matches)
-    const regularSeasonData = await this.fetchCompetitionData([...compIdsToFetch]);
+    // Fetch competition data for all candidates
+    const newCompData = await this.fetchCompetitionData([...compIdsToFetch]);
 
-    // For each match, redirect the entry to use the regular-season comp data
-    for (const { finalsEntry, finalsCompName, completedEntry } of candidates) {
-      const rsData = regularSeasonData[completedEntry.competitionId!];
+    // Case 1: Finals redirect — point active finals entries at their regular-season comp
+    const redirectedCompIds = new Set<string>();
+    for (const { finalsEntry, finalsCompName, completedEntry } of finalsCandidates) {
+      const rsData = newCompData[completedEntry.competitionId!];
       if (!rsData) continue;
 
       const rsComp = rsData.compPayload.include.find((i) => i.type === "competition");
@@ -197,6 +228,32 @@ export class BowlsLinkClient {
       competitionData[completedEntry.competitionId!] = rsData;
       finalsEntry.competitionId = completedEntry.competitionId;
       finalsEntry.competitorId = completedEntry.competitorId;
+      redirectedCompIds.add(completedEntry.competitionId!);
+    }
+
+    // Case 2: Standalone completed entries for the current season
+    for (const completedEntry of completedEntries) {
+      if (!completedEntry.competitionId) continue;
+      if (coveredCompIds.has(completedEntry.competitionId)) continue;
+      if (redirectedCompIds.has(completedEntry.competitionId)) continue;
+
+      const data = newCompData[completedEntry.competitionId];
+      if (!data) continue;
+
+      const comp = data.compPayload.include.find((i) => i.type === "competition");
+      const compName = String(comp?.attributes?.name ?? "");
+
+      // Only include current-season competitions
+      if (!compName.startsWith(seasonPrefix)) continue;
+
+      // Skip if this is a finals comp (name contains "Finals") — the regular-season
+      // redirect should have handled it
+      if (compName.includes("Finals")) continue;
+
+      // Add this completed entry and its competition data
+      competitionData[completedEntry.competitionId] = data;
+      entries.push(completedEntry);
+      coveredCompIds.add(completedEntry.competitionId);
     }
   }
 
