@@ -296,3 +296,154 @@ export const constants = {
   MATCH_2_ID,
   MATCH_FINALS_ID,
 };
+
+// ─── Shared-competition completed-entries fixture ─────────────────────────────
+// Simulates the end-of-season state where two teams are in the SAME completed
+// competition (e.g. Keilor 3 and Keilor 4 in Weekend Div 6). The active
+// entries endpoint returns nothing; both entries come from completed only.
+
+const SHARED_COMP_ID = "comp-shared";
+const SHARED_COMP_NAME = "2025-26 Shared Division";
+const SHARED_ENTRY_A_ID = "entry-A";
+const SHARED_ENTRY_B_ID = "entry-B";
+const SHARED_COMPETITOR_A_ID = "compA";
+const SHARED_COMPETITOR_B_ID = "compB";
+const SHARED_MATCH_1_ID = "shared-match-1";
+const SHARED_RESULT_1_ID = "shared-result-1";
+
+/** Empty active entries — the whole season has ended. */
+export const sharedCompEmptyActiveEntries = {
+  data: { entries: [] as unknown[] },
+  include: [] as unknown[],
+};
+
+/** Completed entries — two different teams in the same competition. */
+export const sharedCompCompletedEntries = {
+  data: {
+    entries: [
+      { type: "entry", id: SHARED_ENTRY_A_ID },
+      { type: "entry", id: SHARED_ENTRY_B_ID },
+    ],
+  },
+  include: [
+    {
+      type: "entry",
+      id: SHARED_ENTRY_A_ID,
+      attributes: { name: "Club A" },
+      includes: {
+        competitor: { type: "competitor", id: SHARED_COMPETITOR_A_ID },
+        competition: { type: "competition", id: SHARED_COMP_ID },
+      },
+    },
+    {
+      type: "entry",
+      id: SHARED_ENTRY_B_ID,
+      attributes: { name: "Club B" },
+      includes: {
+        competitor: { type: "competitor", id: SHARED_COMPETITOR_B_ID },
+        competition: { type: "competition", id: SHARED_COMP_ID },
+      },
+    },
+  ],
+};
+
+/** Competition detail for the shared competition. */
+export const sharedCompCompetitionResponse = {
+  data: {},
+  include: [
+    {
+      type: "competition",
+      id: SHARED_COMP_ID,
+      attributes: {
+        name: SHARED_COMP_NAME,
+        competitionStatus: "completed",
+      },
+    },
+  ],
+};
+
+/** Ladder with both competitors. */
+export const sharedCompLadderResponse = {
+  data: {},
+  include: [
+    {
+      type: "ladderRow",
+      id: "shared-lr-A",
+      attributes: {
+        competitorId: SHARED_COMPETITOR_A_ID,
+        fields: {
+          position: 1, played: 5, wins: 5, losses: 0, draws: 0,
+          byes: 0, score: 100, againstScore: 50,
+          scoreDifference: 50, points: 50,
+        },
+      },
+    },
+    {
+      type: "ladderRow",
+      id: "shared-lr-B",
+      attributes: {
+        competitorId: SHARED_COMPETITOR_B_ID,
+        fields: {
+          position: 2, played: 5, wins: 3, losses: 2, draws: 0,
+          byes: 0, score: 80, againstScore: 70,
+          scoreDifference: 10, points: 30,
+        },
+      },
+    },
+  ],
+};
+
+/** One played match between the two teams. */
+export const sharedCompMatchesResponse = {
+  data: {},
+  include: [
+    {
+      type: "competitor",
+      id: SHARED_COMPETITOR_A_ID,
+      attributes: { name: "Club A" },
+    },
+    {
+      type: "competitor",
+      id: SHARED_COMPETITOR_B_ID,
+      attributes: { name: "Club B" },
+    },
+    {
+      type: "match",
+      id: SHARED_MATCH_1_ID,
+      attributes: {
+        round: 1,
+        roundLabel: "Round 1",
+        matchDayUtc: 1700000000,
+        matchState: "PLAYED",
+        isFinalsSeries: false,
+        pool: 1,
+      },
+      includes: {
+        competitorOne: { id: SHARED_COMPETITOR_A_ID },
+        competitorTwo: { id: SHARED_COMPETITOR_B_ID },
+        result: { id: SHARED_RESULT_1_ID },
+      },
+    },
+    {
+      type: "multiFormatResult",
+      id: SHARED_RESULT_1_ID,
+      attributes: {
+        isCompleted: true,
+        competitorOneScore: 25,
+        competitorTwoScore: 15,
+        competitorOnePoints: 12,
+        competitorTwoPoints: 0,
+        winnerId: SHARED_COMPETITOR_A_ID,
+        status: "complete",
+      },
+    },
+  ],
+};
+
+export const sharedCompConstants = {
+  SHARED_COMP_ID,
+  SHARED_ENTRY_A_ID,
+  SHARED_ENTRY_B_ID,
+  SHARED_COMPETITOR_A_ID,
+  SHARED_COMPETITOR_B_ID,
+};

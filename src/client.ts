@@ -175,12 +175,17 @@ export class BowlsLinkClient {
       }
     }
 
-    // Track which (name, competitionId) combos are already covered by active entries
-    const coveredCompIds = new Set(
-      entries.map((e) => e.competitionId).filter(Boolean),
+    // Track which (name, competitionId) combos are already covered by active entries.
+    // We use a (name::competitionId) key so that multiple teams in the same competition
+    // are each considered separately — deduping by competitionId alone would cause the
+    // second team in a shared competition to be silently dropped.
+    const coveredEntryKeys = new Set(
+      entries
+        .filter((e) => e.name && e.competitionId)
+        .map((e) => `${e.name}::${e.competitionId}`),
     );
 
-    // Gather completed comp IDs we need to fetch:
+    // Gather completed comp IDs we need to fetch (deduped by comp ID for efficiency):
     // - candidates for finals redirect
     // - candidates for standalone completed entries
     const compIdsToFetch = new Set<string>();
@@ -194,7 +199,9 @@ export class BowlsLinkClient {
 
     for (const completedEntry of completedEntries) {
       if (!completedEntry.competitionId) continue;
-      if (coveredCompIds.has(completedEntry.competitionId)) continue;
+
+      const entryKey = `${completedEntry.name}::${completedEntry.competitionId}`;
+      if (coveredEntryKeys.has(entryKey)) continue;
 
       compIdsToFetch.add(completedEntry.competitionId);
 
@@ -234,7 +241,10 @@ export class BowlsLinkClient {
     // Case 2: Standalone completed entries for the current season
     for (const completedEntry of completedEntries) {
       if (!completedEntry.competitionId) continue;
-      if (coveredCompIds.has(completedEntry.competitionId)) continue;
+
+      const entryKey = `${completedEntry.name}::${completedEntry.competitionId}`;
+      if (coveredEntryKeys.has(entryKey)) continue;
+
       if (redirectedCompIds.has(completedEntry.competitionId)) continue;
 
       const data = newCompData[completedEntry.competitionId];
@@ -253,7 +263,7 @@ export class BowlsLinkClient {
       // Add this completed entry and its competition data
       competitionData[completedEntry.competitionId] = data;
       entries.push(completedEntry);
-      coveredCompIds.add(completedEntry.competitionId);
+      coveredEntryKeys.add(entryKey);
     }
   }
 
